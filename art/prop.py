@@ -2,11 +2,12 @@
 
 import itertools
 from abc import ABC, abstractmethod
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import torch
-from diffabs import AbsDom, AbsEle
 from torch import Tensor
+
+from diffabs import AbsDom, AbsEle, ConcDist
 
 from art.utils import valid_lb_ub
 
@@ -17,12 +18,19 @@ class AbsProp(ABC):
         It means: safe(violation) dist=0 means safe(violation) proved by over-approximation.
         Moreover, dist means how much until it becomes safe(violation).
     """
-    def __init__(self, name: str, dom: AbsDom = None):
+    def __init__(self, name: str, dom: Optional[AbsDom], safe_fn: str, viol_fn: str, fn_args: Tuple):
         """
-        :param dom: Prop generally do not bind with AbsDom, it is only used when computing distances.
+        :param dom: the abstract domain to incur corresponding safety/violation functions,
+                    can be None if not calling those functions (e.g., just querying init/safety constraints)
+        :param safe_fn: the method name to call safety distance related functions
+        :param viol_fn: the method name to call violation distance related functions
+        :param fn_args: a tuple of extra method arguments for safety/violation functions
         """
         self.name = name
         self.dom = dom
+        self.safe_fn = safe_fn
+        self.viol_fn = viol_fn
+        self.fn_args = fn_args
         return
 
     @abstractmethod
@@ -38,7 +46,7 @@ class AbsProp(ABC):
 
     def safe_dist(self, outs: AbsEle, *args, **kwargs):
         """ Return the safety distance with the guarantee that dist == 0 => safe. """
-        raise NotImplementedError()
+        return getattr(self.dom.Dist(), self.safe_fn)(outs, *self.fn_args)
 
     def safe_sheep(self, outs: AbsEle, *args, **kwargs) -> Tensor:
         """ Return a "black sheep" state of safety property such that sheep is safe => all safe.
@@ -48,7 +56,7 @@ class AbsProp(ABC):
 
     def viol_dist(self, outs: AbsEle, *args, **kwargs):
         """ Return the safety distance with the guarantee that dist == 0 => violation. """
-        raise NotImplementedError()
+        return getattr(self.dom.Dist(), self.viol_fn)(outs, *self.fn_args)
 
     def viol_sheep(self, outs: AbsEle, *args, **kwargs) -> Tensor:
         """ Return a "black sheep" state of safety property such that sheep is violating => all violating.
@@ -58,15 +66,15 @@ class AbsProp(ABC):
 
     def safe_dist_conc(self, outs: Tensor, *args, **kwargs):
         """ Return the concrete safety distance of a state but not abstraction. """
-        raise NotImplementedError()
+        return getattr(ConcDist, self.safe_fn)(outs, *self.fn_args)
 
     def viol_dist_conc(self, outs: Tensor, *args, **kwargs):
         """ Return the concrete violation distance of a state but not abstraction. """
-        raise NotImplementedError()
+        return getattr(ConcDist, self.viol_fn)(outs, *self.fn_args)
 
     def tex(self) -> str:
         """ Return the property name in tex format for pretty printing. """
-        raise NotImplementedError()
+        return self.name
     pass
 
 
@@ -200,16 +208,16 @@ class AndProp(AbsProp):
             lb, ub = lb.to(device), ub.to(device)
         return lb, ub
 
-    def rule(self, device=None) -> Tensor:
+    def bitmap(self, device=None) -> Tensor:
         """ Return the bit tensor corresponding to default LB/UB, showing which properties they should satisfy. """
         r = self.labels
         if device is not None:
             r = r.to(device)
         return r
 
-    def props_of(self, rule: Tensor) -> List[AbsProp]:
+    def props_of(self, bitmap: Tensor) -> List[AbsProp]:
         """ Return the corresponding properties of certain indices. """
-        idxs = rule.nonzero().squeeze(dim=-1)
+        idxs = bitmap.nonzero().squeeze(dim=-1)
         props = [self.props[i] for i in idxs]
         return props
 
