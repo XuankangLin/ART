@@ -5,9 +5,13 @@ from pathlib import Path
 
 import torch
 
+from diffabs import DeeppolyDom
+
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art.prop import lbub_exclude, AndProp
+from art.acas import AcasNetID
+from art.utils import total_area
 
 
 def test_lbub_exclusion_1():
@@ -40,4 +44,45 @@ def test_lbub_exclusion_3():
     # each dimension adds 2 pieces (left & right), no overlapping
     assert len(res_lb) == len(res_ub)
     assert len(res_lb) == 2 * len(lb1)
+    return
+
+
+def test_andprop_conjoin():
+    """ Validate (manually..) that the AndProp is correct. """
+    dom = DeeppolyDom()
+
+    def _go(id):
+        props = id.applicable_props(dom)
+        ap = AndProp(props)
+
+        print('-- For network', id)
+        for p in props:
+            print('-- Has', p.name)
+            lb, ub = p.lbub()
+            print('   LB:', lb)
+            print('   UB:', ub)
+
+        lb, ub = ap.lbub()
+        print('-- All conjoined,', ap.name)
+        print('   LB:', lb)
+        print('   UB:', ub)
+        print('   Labels:', ap.labels)
+        print('Cnt:', len(lb))
+        for i in range(len(lb)):
+            print('  ', i, 'th piece, width:', ub[i] - lb[i], f'area: {total_area(lb[[i]], ub[[i]]) :E}')
+        print()
+        return
+
+    ''' <1, 1> is tricky, as it has many props;
+        <1, 9> is special, as it is different from many others;
+        Many others have prop1, prop2, prop3, prop4 would generate 3 pieces, in which prop1 and prop2 merged.
+    '''
+    # _go(AcasNetID(1, 1))
+    # _go(AcasNetID(1, 9))
+    # exit(0)
+
+    for id in AcasNetID.all_ids():
+        _go(id)
+
+    print('XL: Go manually check the outputs..')
     return

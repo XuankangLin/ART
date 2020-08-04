@@ -4,7 +4,7 @@ import itertools
 import sys
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Iterable
 
 import torch
 from torch import Tensor
@@ -77,7 +77,7 @@ class AbsProp(ABC):
 class OneProp(AbsProp):
     """ One specific property that calls corresponding safety/violation distance methods. """
 
-    def __init__(self, name: str, dom: Optional[AbsDom], safe_fn: str, viol_fn: str, fn_args: Tuple):
+    def __init__(self, name: str, dom: Optional[AbsDom], safe_fn: str, viol_fn: str, fn_args: Iterable):
         """
         :param dom: the abstract domain to incur corresponding safety/violation functions,
                     can be None if not calling those functions (e.g., just querying init/safety constraints)
