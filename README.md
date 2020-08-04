@@ -16,6 +16,7 @@ To replay the evaluation, run individual script from `scripts/` by
 ```
 bash scripts/...
 ```
+The corresponding logs have been saved in `results/xxx/...` directory.
 
 
 ## License

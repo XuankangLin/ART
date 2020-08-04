@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import csv
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Union, List, Tuple, Callable, Optional
@@ -31,7 +32,9 @@ from torch import Tensor, nn
 
 from diffabs import AbsDom, AbsEle
 
-from art.prop import AbsProp
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from art.prop import OneProp
 from art.exp import ConcIns
 from art.utils import valid_lb_ub
 
@@ -42,7 +45,7 @@ IN_FEATURES = 6
 OUT_FEATURES = 2
 
 
-class CollisionProp(AbsProp):
+class CollisionProp(OneProp):
     """ Defining the Collision Avoidance/Detection safety property. """
     def __init__(self, dom: Optional[AbsDom],
                  bound_mins: Union[Tensor, List[float]], bound_maxs: Union[Tensor, List[float]], larger_category: int):
@@ -202,6 +205,9 @@ class CollisionMPNet(nn.Module):
         self.fc2 = dom.Linear(FC2_NEURONS, FC2_NEURONS)
         self.fc3 = dom.Linear(FC2_NEURONS, OUT_FEATURES)
         return
+
+    def __iter__(self):
+        return iter([self.fc1, self.relu, self.maxpool, self.fc2, self.relu, self.fc3])
 
     def forward(self, x: Union[AbsEle, Tensor]):
         x = self.relu(self.fc1(x))

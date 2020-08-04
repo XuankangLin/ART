@@ -1,11 +1,23 @@
 """ Common utilities and functions used in multiple experiments. """
 
+import argparse
+import logging
+import random
+import sys
+import time
 from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Union, List, Optional
 
-from torch.utils import data
-from typing import Union, List
-
+import numpy as np
+import torch
 from torch import Tensor
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils import data
+
+from diffabs import DeeppolyDom, IntervalDom
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art.utils import valid_lb_ub
 
@@ -81,3 +93,121 @@ class ConcIns(PseudoLenDataset):
     def _getitem(self, idx):
         return self.inputs[idx], self.labels[idx]
     pass
+
+
+class ExpArgParser(argparse.ArgumentParser):
+    def __init__(self, log_dir: Optional[str], *args, **kwargs):
+        """ Override constructor to add more arguments or modify existing defaults.
+        :param log_dir: if not None, the directory for log file to dump, the log file name is fixed
+        """
+        super().__init__(*args, **kwargs)
+        self.log_dir = log_dir
+
+        # experiment hyper-parameters
+        self.add_argument('--exp_fn', type=str,
+                          help='the experiment function to run')
+        self.add_argument('--seed', type=int, default=None,
+                          help='the random seed for all')
+
+        # art hyper-parameters
+        self.add_argument('--dom', type=str, choices=['deeppoly', 'interval'], default='deeppoly',
+                          help='the abstract domain to use')
+        self.add_argument('--start_abs_cnt', type=int, default=5000,
+                          help='do some refinement before training to have more training data')
+        self.add_argument('--max_abs_cnt', type=int, default=10000,
+                          help='stop refinement after exceeding this many abstractions')
+        self.add_argument('--refine_top_k', type=int, default=200,
+                          help='select top k abstractions to refine every time')
+        self.add_argument('--tiny_width', type=float, default=1e-3,
+                          help='refine a dimension only when its width still > this tiny_width')
+
+        # training hyper-parameters
+        self.add_argument('--lr', type=float, default=1e-3,
+                          help='initial learning rate during training')
+        self.add_argument('--batch_size', type=int, default=32,
+                          help='mini batch size during each training epoch')
+        self.add_argument('--min_epochs', type=int, default=90,
+                          help='at least run this many epochs for sufficient training')
+        self.add_argument('--max_epochs', type=int, default=100,
+                          help='at most run this many epochs before too long')
+
+        # training flags
+        self.add_argument('--use_scheduler', action='store_true', default=False,
+                          help='using learning rate scheduler during training')
+        self.add_argument('--no_pts', action='store_true', default=False,
+                          help='not using concrete sampled/prepared points during training')
+        self.add_argument('--no_abs', action='store_true', default=False,
+                          help='not using abstractions during training')
+        self.add_argument('--no_refine', action='store_true', default=False,
+                          help='disable refinement during training')
+
+        # printing flags
+        group = self.add_mutually_exclusive_group()
+        group.add_argument("--quiet", action="store_true", default=False,
+                           help='show warning level logs (default: info)')
+        group.add_argument("--debug", action="store_true", default=False,
+                           help='show debug level logs (default: info)')
+        return
+
+    def parse_args(self, args=None, namespace=None):
+        res = super().parse_args(args, namespace)
+        self.setup_logger(res)  # extra tasks for our experiments
+        if res.seed is not None:
+            random_seed(res.seed)
+        self.setup_rest(res)
+        return res
+
+    def setup_logger(self, args: argparse.Namespace):
+        logger = logging.getLogger()
+        formatter = logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s')
+
+        if args.quiet:
+            # default to be warning level
+            pass
+        elif args.debug:
+            logger.setLevel(logging.DEBUG)
+        else:
+            logger.setLevel(logging.INFO)
+
+        timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+        args.stamp = f'{args.exp_fn}-{timestamp}'
+        logger.handlers = []  # reset, otherwise it may duplicate many times when calling setup_logger() multiple times
+        if self.log_dir is not None:
+            log_path = Path(self.log_dir, f'{args.stamp}.log')
+            file_handler = logging.FileHandler(log_path)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        return
+
+    @abstractmethod
+    def setup_rest(self, args: argparse.Namespace):
+        """ Override this method to set up those not easily specified via command line arguments. """
+        # validation
+        assert not (args.no_pts and args.no_abs), 'training what?'
+
+        args.dom = {
+            'deeppoly': DeeppolyDom(),
+            'interval': IntervalDom()
+        }[args.dom]
+
+        if args.use_scheduler:
+            # having a scheduler does improve the accuracy quite a bit
+            args.scheduler_fn = lambda opti: ReduceLROnPlateau(opti, factor=0.8, patience=10)
+        else:
+            args.scheduler_fn = lambda opti: None
+        return
+    pass
+
+
+def random_seed(seed):
+    """ Set random seed for all. """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+    return
