@@ -145,18 +145,18 @@ class AcasNetID(object):
         phi2 = AcasProp.property2(dom)
         phi8 = AcasProp.property8(dom)
 
-        ids = phi2.applicable | phi8.applicable
+        ids = phi2.applicable.bool() | phi8.applicable.bool()
         ids = ids.nonzero()  # Batch x 2
         ids = [AcasNetID(row[0] + 1, row[1] + 1) for row in ids]
         return ids
 
     @classmethod
-    def goal_accuracy_ids(cls, dom: AbsDom) -> List['AcasNetID']:
+    def goal_accuracy_ids(cls, dom: AbsDom) -> List[AcasNetID]:
         """ Those networks checked safe are to show that the accuracy impact is mild. """
         phi2 = AcasProp.property2(dom)
         phi8 = AcasProp.property8(dom)
 
-        ids = ~ (phi2.applicable | phi8.applicable)
+        ids = ~(phi2.applicable.bool() | phi8.applicable.bool())
         ids = ids.nonzero()  # Batch x 2
         ids = [AcasNetID(row[0] + 1, row[1] + 1) for row in ids]
         return ids
