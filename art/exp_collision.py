@@ -214,7 +214,7 @@ def train_collision(net: nn.Module, full_props: List[c.CollisionProp], args: Nam
         if not args.no_abs:
             absset.reset_claimed_len()
         if (not args.no_pts) and (not args.no_abs):
-            ''' Might simplify this to just using the amount of abstractions, is it unnecessarily complicated. '''
+            ''' Might simplify this to just using the amount of abstractions, is it unnecessarily complicated? '''
             # need to enumerate both
             max_claimed_len = min(trainset.claimed_len, absset.claimed_len)
             # max_claimed_len = trainset.claimed_len
