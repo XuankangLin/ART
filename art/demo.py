@@ -17,12 +17,11 @@ from torch.utils import data
 
 from diffabs import AbsDom, AbsEle, IntervalDom, AbsData
 
-from art import utils
-
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art.prop import OneProp
 from art.bisecter import Bisecter
+from art import utils
 
 
 class DemoIn(enum.IntEnum):
