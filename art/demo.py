@@ -343,7 +343,7 @@ def naive_split(lb: Tensor, ub: Tensor, K: int) -> Tuple[Tensor, Tensor]:
     return lbs, ubs
 
 
-def art(top_k: int = 10, lr: float = 1e-3, batch_size: int = 16):
+def art(top_k: int = 10, lr: float = 1e-2, batch_size: int = 16):
     """ VErification Guided Abstracted Learning towards one prop: Train to get all split regions safe.
     :param top_k: if too large, later training epochs will incur many unnecessary refinements
     :param lr: 1e-3 needs 35 epochs, 1e-2 needs 11 epochs.

@@ -1,0 +1,4 @@
+future==0.18.2
+numpy==1.19.1
+torch==1.5.0
+diffabs==0.1
