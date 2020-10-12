@@ -146,7 +146,7 @@ class AcasNetID(object):
         phi8 = AcasProp.property8(dom)
 
         ids = phi2.applicable.bool() | phi8.applicable.bool()
-        ids = ids.nonzero()  # Batch x 2
+        ids = ids.nonzero(as_tuple=False)  # Batch x 2
         ids = [AcasNetID(row[0] + 1, row[1] + 1) for row in ids]
         return ids
 
@@ -157,7 +157,7 @@ class AcasNetID(object):
         phi8 = AcasProp.property8(dom)
 
         ids = ~(phi2.applicable.bool() | phi8.applicable.bool())
-        ids = ids.nonzero()  # Batch x 2
+        ids = ids.nonzero(as_tuple=False)  # Batch x 2
         ids = [AcasNetID(row[0] + 1, row[1] + 1) for row in ids]
         return ids
     pass
@@ -228,7 +228,7 @@ class AcasProp(OneProp):
         :param dir: directory prefix
         :return: all network names that this property is applicable to
         """
-        ids = self.applicable.nonzero()  # Batch x 2
+        ids = self.applicable.nonzero(as_tuple=False)  # Batch x 2
         ids = [AcasNetID(row[0] + 1, row[1] + 1) for row in ids]
         return [id.fpath(dir) for id in ids]
 
@@ -838,7 +838,7 @@ def inspect_prop_pts(dom: AbsDom, sample_size=1000):
                 safe_dist = prop.safe_dist(pt_outs)
 
             safe_bits = safe_dist == 0.
-            safe_ratio = len(safe_bits.nonzero()) / float(sample_size)
+            safe_ratio = len(safe_bits.nonzero(as_tuple=False)) / float(sample_size)
             print('Iter', i, ': Safe ratio for point outputs:', safe_ratio)
             if safe_ratio != 1.0:
                 spurious_bits = ~ safe_bits

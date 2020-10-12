@@ -34,6 +34,7 @@ def test_prop_load():
 
         mid = (prop.bound_mins + prop.bound_maxs) / 2.
         eps = (prop.bound_maxs - prop.bound_mins) / 2.
+        mid, eps = mid.to(device), eps.to(device)
         idx = _locate(ds.inputs, mid)
         label = ds.labels[idx]
         cnts[idx].append(eps)
@@ -83,12 +84,12 @@ def test_net_load():
         outs = net(ds.inputs)
         predicted = outs.argmax(dim=-1)
 
-        accuracy = len((predicted == ds.labels).nonzero()) / len(ds.labels)
+        accuracy = len((predicted == ds.labels).nonzero(as_tuple=False)) / len(ds.labels)
         print(f'-- Accuracy for {fpath.absolute().name}: {accuracy}')
         assert accuracy >= 0.99
 
     # inspect unsafe ones from last run, since all networks are the same, it doesn't matter
-    failed_bits = (predicted != ds.labels).nonzero().squeeze(dim=1)
+    failed_bits = (predicted != ds.labels).nonzero(as_tuple=True)
     failed_ins = ds.inputs[failed_bits]
     failed_labels = ds.labels[failed_bits]
     failed_outs = outs[failed_bits]

@@ -31,12 +31,12 @@ import torch
 from torch import Tensor, nn
 
 from diffabs import AbsDom, AbsEle
+from diffabs.utils import valid_lb_ub
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art.prop import OneProp
 from art.exp import ConcIns
-from art.utils import valid_lb_ub
 
 
 COLLISION_DIR = Path(__file__).resolve().parent.parent / 'data' / 'collision'

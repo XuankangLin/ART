@@ -1,19 +1,14 @@
 """ Base of Input/Output Properties. """
 
 import itertools
-import sys
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import Tuple, List, Optional, Iterable
 
 import torch
 from torch import Tensor
 
 from diffabs import AbsDom, AbsEle, ConcDist
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-from art.utils import valid_lb_ub
+from diffabs.utils import valid_lb_ub
 
 
 class AbsProp(ABC):
@@ -249,7 +244,8 @@ class AndProp(AbsProp):
 
     def props_of(self, bitmap: Tensor) -> List[AbsProp]:
         """ Return the corresponding properties of certain indices. """
-        idxs = bitmap.nonzero().squeeze(dim=-1)
+        idxs = bitmap.nonzero(as_tuple=True)[0]
+        assert idxs.dim() == 1
         props = [self.props[i] for i in idxs]
         return props
 
@@ -264,11 +260,16 @@ class AndProp(AbsProp):
 
         res = []
         for i, prop in enumerate(self.props):
-            bits = bitmap[..., i].nonzero().squeeze(dim=-1)
-            if len(bits) == 0:
+            bits = bitmap[..., i]
+            if not bits.any():
                 # no one here needs to obey this property
                 continue
 
+            ''' The default nonzero(as_tuple=True) returns a tuple, make scatter_() unhappy.
+                Here we just extract the real data from it to make it the same as old nonzero().squeeze(dim=-1).
+            '''
+            bits = bits.nonzero(as_tuple=True)[0]
+            assert bits.dim() == 1
             piece_outs = outs[bits]
             piece_dists = prop.safe_dist(piece_outs, *args, **kwargs)
             full_dists = torch.zeros(len(bitmap), *piece_dists.size()[1:], device=piece_dists.device)
@@ -284,11 +285,16 @@ class AndProp(AbsProp):
         """
         res = []
         for i, prop in enumerate(self.props):
-            bits = bitmap[..., i].nonzero().squeeze(dim=-1)
-            if len(bits) == 0:
+            bits = bitmap[..., i]
+            if not bits.any():
                 # no one here needs to obey this property
                 continue
 
+            ''' The default nonzero(as_tuple=True) returns a tuple, make scatter_() unhappy.
+                Here we just extract the real data from it to make it the same as old nonzero().squeeze(dim=-1).
+            '''
+            bits = bits.nonzero(as_tuple=True)[0]
+            assert bits.dim() == 1
             piece_outs = outs[bits]
             piece_dists = prop.viol_dist(piece_outs, *args, **kwargs)
             full_dists = torch.full((len(bitmap), *piece_dists.size()[1:]), float('inf'), device=piece_dists.device)

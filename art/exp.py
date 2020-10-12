@@ -3,7 +3,6 @@
 import argparse
 import logging
 import random
-import sys
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -16,10 +15,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils import data
 
 from diffabs import DeeppolyDom, IntervalDom
-
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-
-from art.utils import valid_lb_ub
+from diffabs.utils import valid_lb_ub
 
 
 class PseudoLenDataset(data.Dataset, ABC):

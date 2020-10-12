@@ -10,11 +10,12 @@ from torch import Tensor, nn, autograd
 from torch.utils.data import DataLoader
 
 from diffabs import AbsDom, AbsData
+from diffabs.utils import valid_lb_ub
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art.prop import AbsProp
-from art.utils import valid_lb_ub, total_area
+from art.utils import total_area
 
 
 def empty_like(t: Tensor) -> Tensor:
@@ -147,7 +148,7 @@ class Bisecter(object):
         _, topk_idxs = rem_safe_dist.topk(top_k, largest=largest, sorted=False)  # topk_idxs: size <K>
         # scatter, topk_idxs are 0, others are 1
         other_idxs = torch.ones(len(rem_safe_dist), device=rem_safe_dist.device).byte().scatter_(-1, topk_idxs, 0)
-        other_idxs = other_idxs.nonzero().squeeze(dim=-1)  # <Batch-K>
+        other_idxs = other_idxs.nonzero(as_tuple=True)  # <Batch-K>
 
         batch_lb, wl_lb = rem_lb[topk_idxs], rem_lb[other_idxs]
         batch_ub, wl_ub = rem_ub[topk_idxs], rem_ub[other_idxs]
