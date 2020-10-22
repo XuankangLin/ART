@@ -3,6 +3,7 @@
 import argparse
 import logging
 import random
+import signal
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -207,3 +208,31 @@ def random_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
     return
+
+
+class timeout:
+    """ Raise error when timeout. Following that in <https://stackoverflow.com/a/22348885>.
+    Usage:
+        try:
+            with timeout(sec=1):
+                ...
+        except TimeoutError:
+            ...
+    """
+    def __init__(self, sec):
+        self.seconds = sec
+        self.error_message = 'Timeout after %d seconds' % sec
+        return
+
+    def handle_timeout(self, signum, frame):
+        raise TimeoutError(self.error_message)
+
+    def __enter__(self):
+        signal.signal(signal.SIGALRM, self.handle_timeout)
+        signal.alarm(self.seconds)
+        return
+
+    def __exit__(self, type, value, traceback):
+        signal.alarm(0)
+        return
+    pass

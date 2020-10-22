@@ -44,6 +44,8 @@ class CollisionArgParser(exp.ExpArgParser):
                           help='avoid too violent grads')
         self.add_argument('--accu_bar', type=float, default=None,
                           help='acceptable accuracy to pick best safety loss, if None, just pick best accuracy')
+        self.add_argument('--certify_timeout', type=int, default=30,
+                          help='how many seconds to try certifying the trained network against correctness properties')
 
         self.set_defaults(exp_fn='test_all', use_scheduler=True)
         return
@@ -293,7 +295,7 @@ def train_collision(net: nn.Module, full_props: List[c.CollisionProp], args: Nam
             for j, p in enumerate(ps):
                 tmp_v = Bisecter(args.dom, p)
                 in_lb, in_ub = p.lbub(device)
-                if tmp_v.try_certify(in_lb, in_ub, None, net, args.batch_size, stop_on_k_all=10000):
+                if tmp_v.try_certify(in_lb, in_ub, None, net, args.batch_size, timeout_sec=args.certify_timeout):
                     tot_certified += (5 - j)
                     logging.info(f'Certified prop based at {k} using {j}th eps, now {tot_certified}/{5*(i+1)}.')
                     break

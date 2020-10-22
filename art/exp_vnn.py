@@ -17,8 +17,8 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art import acas, exp
 from art.prop import AndProp
-from art.bisecter import Bisecter as OldBisecter
-from art.refine import Bisecter as NewBisecter
+from art.bisecter import Bisecter
+from art.cluster import Cluster
 from art.vnn import VNN20Info
 from art.utils import pp_time, fmt_args
 
@@ -61,7 +61,7 @@ def _verify(nid: acas.AcasNetID, all_props: AndProp, args: Namespace):
     net, bound_mins, bound_maxs = acas.AcasNet.load_nnet(fpath, dom, device)
     # logging.info(net)  # no need to print acas network here, all the same
 
-    v = NewBisecter(dom, all_props) if args.use_new else OldBisecter(dom, all_props)
+    v = Cluster(dom, all_props) if args.use_new else Bisecter(dom, all_props)
 
     in_lb, in_ub = all_props.lbub(device)
     in_bitmap = all_props.bitmap(device)

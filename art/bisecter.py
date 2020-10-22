@@ -16,6 +16,7 @@ from diffabs.utils import valid_lb_ub
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art.prop import AbsProp
+from art.exp import timeout
 from art.utils import total_area, pp_time, sample_points, pp_cuda_mem
 
 
@@ -108,6 +109,22 @@ class Bisecter(object):
         split_safe_dists = torch.cat(split_safe_dists, dim=0)
         return split_grads, split_safe_dists
 
+    @staticmethod
+    def _transfer_safe(new_lb: Tensor, new_ub: Tensor, new_extra: Optional[Tensor], new_safe_dist: Tensor,
+                       new_grad: Tensor) -> Tuple[Tuple[Tensor, Tensor, Optional[Tensor]],
+                                                  Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor]]:
+        safe_bits = new_safe_dist <= 0.
+        rem_bits = ~ safe_bits
+
+        new_safe_lb, rem_lb = new_lb[safe_bits], new_lb[rem_bits]
+        new_safe_ub, rem_ub = new_ub[safe_bits], new_ub[rem_bits]
+        new_safe_extra = None if new_extra is None else new_extra[safe_bits]
+        rem_extra = None if new_extra is None else new_extra[rem_bits]
+        rem_safe_dist, rem_grad = new_safe_dist[rem_bits], new_grad[rem_bits]
+
+        return (new_safe_lb, new_safe_ub, new_safe_extra),\
+               (rem_lb, rem_ub, rem_extra, rem_safe_dist, rem_grad)
+
     def _pick_top(self, top_k: int, wl_lb: Tensor, wl_ub: Tensor, wl_extra: Optional[Tensor], wl_safe_dist: Tensor,
                   wl_grad: Tensor, largest: bool) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor,
                                                            Tensor, Tensor, Optional[Tensor], Tensor, Tensor]:
@@ -190,44 +207,30 @@ class Bisecter(object):
             iter += 1
 
             if len(new_lb) > 0:
-                # First add the new_lb, new_ub into sorted list, by their corresponding safety loss.
-                ''' I also tried using a 'factor' tensor, with LB = LB * factor and UB = UB * factor, to compute gradient
-                    w.r.t. 'factor'. However, that is much worse than the grad w.r.t. LB and UB directly. One possible
-                    reason is that 'factor' can only shrink the space in one direction towards its mid point. This has
-                    little to do with actual bisection later on. Grads w.r.t. LB and UB is more directly related.
-                '''
-                ''' Removed viol_dists etc., because viol_dist is worse than sample-to-check. If viol_dist can certify
-                    violation, sampling can absolutely do the same, vice not versa. So there is no need to compute
-                    viol_dist anymore. It also shows that using 'safe' is slightly better than 'viol' as source based
-                    on first two hard instances in acas-hard.
+                ''' It's important to have no_grad() here, otherwise the GPU memory will keep growing. With no_grad(),
+                    the GPU memory usage is stable. enable_grad() is called inside for grad computation.
+
+                    viol_dist is now removed, because if viol_dist can certify violation, sampling can absolutely do the
+                    same, vice NOT versa. So there is no need to compute viol_dist anymore. It also shows that using
+                    'safe' is slightly better than 'viol' as source based on first two hard instances in acas-hard.
+
+                    I also tried using a 'factor' tensor before, with LB = LB * factor and UB = UB * factor, to compute
+                    gradient w.r.t. 'factor'. However, that is much worse than the grad w.r.t. LB and UB directly. One
+                    possible reason is that 'factor' can only shrink the space in one direction towards its mid point.
+                    This has little to do with actual bisection later on. Grads w.r.t. LB/UB is more directly related.
                 '''
                 with torch.no_grad():
-                    ''' It's important to have no_grad() here, otherwise the GPU memory will keep growing. With
-                        no_grad(), the GPU memory usage is stable. enable_grad() is called inside for grad computation.
-                    '''
                     new_grad, new_safe_dist = self._grad_dists_of(new_lb, new_ub, new_extra, forward_fn, batch_size)
 
-                # process safe abstractions here rather than later
-                safe_bits = new_safe_dist <= 0.
-                rem_bits = ~ safe_bits
-
                 logging.debug(f'At iter {iter}, another {len(new_lb)} boxes are processed.')
-                if safe_bits.any():
-                    # transfer certified safe ones
-                    new_safe_lb, rem_lb = new_lb[safe_bits], new_lb[rem_bits]  # for calculating area only
-                    new_safe_ub, rem_ub = new_ub[safe_bits], new_ub[rem_bits]
-                    rem_extra = None if new_extra is None else new_extra[rem_bits]  # new_safe_extra not needed for area
-                    rem_safe_dist = new_safe_dist[rem_bits]
-                    rem_grad = new_grad[rem_bits]
 
-                    new_safes_area = total_area(new_safe_lb, new_safe_ub)
-                    safes_area += new_safes_area
-                    logging.debug(f'In which {len(new_safe_lb)} confirmed safe.')
-                else:
-                    # nothing to split, inherit everything
-                    rem_lb, rem_ub, rem_extra = new_lb, new_ub, new_extra
-                    rem_safe_dist, rem_grad = new_safe_dist, new_grad
-                    logging.debug(f'In which no new abstractions confirmed safe.')
+                # process safe abstractions here rather than later
+                (new_safe_lb, new_safe_ub, _), (rem_lb, rem_ub, rem_extra, rem_safe_dist, rem_grad) =\
+                    self._transfer_safe(new_lb, new_ub, new_extra, new_safe_dist, new_grad)
+                logging.debug(f'In which {len(new_safe_lb)} confirmed safe.')
+
+                new_safes_area = total_area(new_safe_lb, new_safe_ub)
+                safes_area += new_safes_area
 
                 if len(rem_lb) > 0:
                     # sample check the rest and add to worklist
@@ -255,28 +258,41 @@ class Bisecter(object):
 
             logging.debug(f'In worklist, safe dist min: {wl_safe_dist.min()}, max: {wl_safe_dist.max()}.')
 
-            if batch_size >= len(wl_lb):
-                # entire wl is to be picked
-                batch_lb, batch_ub, batch_extra, batch_grad = wl_lb, wl_ub, wl_extra, wl_grad
-                wl_lb, wl_ub = empty(), empty()
-                wl_extra = None if wl_extra is None else empty().byte()
-                wl_grad = empty()
-                wl_safe_dist = empty()
-            else:
-                # pick small loss boxes to bisect first for verification, otherwise BFS style consumes huge memory
-                tmp = self._pick_top(batch_size, wl_lb, wl_ub, wl_extra, wl_safe_dist, wl_grad, largest=False)
-                batch_lb, batch_ub, batch_extra, batch_grad = tmp[:4]
-                wl_lb, wl_ub, wl_extra, wl_grad, wl_safe_dist = tmp[4:]
+            ''' Pick small loss boxes to bisect first for verification, otherwise BFS style consumes huge memory.
+                There is no need to check if entire wl is selected, topk() should do that automatically (I suppose).
+            '''
+            tmp = self._pick_top(batch_size, wl_lb, wl_ub, wl_extra, wl_safe_dist, wl_grad, largest=False)
+            batch_lb, batch_ub, batch_extra, batch_grad = tmp[:4]
+            wl_lb, wl_ub, wl_extra, wl_grad, wl_safe_dist = tmp[4:]
 
             refined_outs = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
             new_lb, new_ub = refined_outs[:2]
             new_extra = None if batch_extra is None else refined_outs[2]
         return None
 
+    @staticmethod
+    def _transfer_tiny(new_lb: Tensor, new_ub: Tensor, new_extra: Optional[Tensor],
+                       new_safe_dist: Tensor, new_grad: Tensor,
+                       tiny_width: float) -> Tuple[Tuple[Tensor, Tensor, Optional[Tensor]],
+                                                   Tuple[Tensor, Tensor, Optional[Tensor], Tensor, Tensor]]:
+        width = new_ub - new_lb
+        tiny_bits = (width <= tiny_width).all(dim=1)  # pick those whose dimensions are all tiny
+        rem_bits = ~ tiny_bits
+
+        new_tiny_lb, rem_lb = new_lb[tiny_bits], new_lb[rem_bits]
+        new_tiny_ub, rem_ub = new_ub[tiny_bits], new_ub[rem_bits]
+        new_tiny_extra = None if new_extra is None else new_extra[tiny_bits]
+        rem_extra = None if new_extra is None else new_extra[rem_bits]
+        rem_safe_dist, rem_grad = new_safe_dist[rem_bits], new_grad[rem_bits]
+
+        return (new_tiny_lb, new_tiny_ub, new_tiny_extra),\
+               (rem_lb, rem_ub, rem_extra, rem_safe_dist, rem_grad)
+
     def split(self, lb: Tensor, ub: Tensor, extra: Optional[Tensor], forward_fn: nn.Module, batch_size: int,
               stop_on_k_all: int = None,
               stop_on_k_new: int = None,
               stop_on_k_ops: int = None,
+              tiny_width: float = None,
               collapse_res: bool = True) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]:
         """ Different from verify(), split() does breadth-first traversal. Its objective is to have roughly even
             abstractions with small safety losses for the optimization later.
@@ -293,31 +309,33 @@ class Bisecter(object):
         :param stop_on_k_new: if not None, split() stops after the amount of abstractions introduced by this split()
                               call exceeds this bar.
         :param stop_on_k_ops: if not None, split() stops after this many refinement steps have been applied.
+        :param tiny_width: if not None, stop refining one dimension if its width is already <= this bar,
+                           e.g., setting tiny_width=1e-3 would ensure all refined abstraction dimension width > 5e-4.
         :return: <LB, UB> when extra is None, otherwise <LB, UB, extra>
         """
-        # TODO incorporate the tiny_width to old Bisecter as well
         assert valid_lb_ub(lb, ub)
         assert batch_size > 0
 
-        def _validate_stop_criterion(v):
-            assert v is None or (isinstance(v, int) and v > 0)
+        def _validate_stop_criterion(v, pivot: int):
+            assert v is None or (isinstance(v, int) and v > pivot)
             return
-        _validate_stop_criterion(stop_on_k_all)
-        _validate_stop_criterion(stop_on_k_new)
-        _validate_stop_criterion(stop_on_k_ops)
+        _validate_stop_criterion(stop_on_k_all, 0)
+        _validate_stop_criterion(stop_on_k_new, 0)
+        _validate_stop_criterion(stop_on_k_ops, -1)  # allow 0 refinement steps, i.e., just evaluate, no refine
 
         def empty() -> Tensor:
             return empty_like(lb)
 
         n_orig_abs = len(lb)
 
+        # Not storing viol_lb anymore, as viol_dist is no longer computed. Those violated regions are still refined.
         wl_lb, wl_ub = empty(), empty()
         safe_lb, safe_ub = empty(), empty()
-        viol_lb, viol_ub = empty(), empty()
+        tiny_lb, tiny_ub = empty(), empty()
         wl_extra = None if extra is None else empty().byte()
         safe_extra = None if extra is None else empty().byte()
-        viol_extra = None if extra is None else empty().byte()
-        wl_safe_dist, wl_viol_dist, wl_grad = empty(), empty(), empty()
+        tiny_extra = None if extra is None else empty().byte()
+        wl_safe_dist, wl_grad = empty(), empty()
 
         new_lb, new_ub, new_extra = lb, ub, extra
         iter = 0
@@ -325,21 +343,47 @@ class Bisecter(object):
             iter += 1
 
             if len(new_lb) > 0:
-                # by default, just use the safety loss as gradient source  # FIXME use which loss
-                new_grad, new_safe_dist, new_viol_dist = self._grad_dists_of(new_lb, new_ub, new_extra, forward_fn,
-                                                                             'safe', batch_size)
-                wl_lb = cat0(wl_lb, new_lb)
-                wl_ub = cat0(wl_ub, new_ub)
-                wl_extra = cat0(wl_extra, new_extra)
-                wl_safe_dist = cat0(wl_safe_dist, new_safe_dist)
-                wl_viol_dist = cat0(wl_viol_dist, new_viol_dist)
-                wl_grad = cat0(wl_grad, new_grad)
+                with torch.no_grad():
+                    ''' It's important to have no_grad() here, otherwise the GPU memory will keep growing. With
+                        no_grad(), the GPU memory usage is stable. enable_grad() is called inside for grad computation.
+                    '''
+                    new_grad, new_safe_dist = self._grad_dists_of(new_lb, new_ub, new_extra, forward_fn, batch_size)
+
+                logging.debug(f'At iter {iter}, another {len(new_lb)} boxes are processed.')
+
+                # process safe abstractions here rather than later
+                (new_safe_lb, new_safe_ub, new_safe_extra), (rem_lb, rem_ub, rem_extra, rem_safe_dist, rem_grad) =\
+                    self._transfer_safe(new_lb, new_ub, new_extra, new_safe_dist, new_grad)
+                logging.debug(f'In which {len(new_safe_lb)} confirmed safe.')
+
+                safe_lb = cat0(safe_lb, new_safe_lb)
+                safe_ub = cat0(safe_ub, new_safe_ub)
+                safe_extra = cat0(safe_extra, new_safe_extra)
+
+                if tiny_width is not None:
+                    (new_tiny_lb, new_tiny_ub, new_tiny_extra), (rem_lb, rem_ub, rem_extra, rem_safe_dist, rem_grad) =\
+                        self._transfer_tiny(rem_lb, rem_ub, rem_extra, rem_safe_dist, rem_grad, tiny_width)
+                    tiny_lb = cat0(tiny_lb, new_tiny_lb)
+                    tiny_ub = cat0(tiny_ub, new_tiny_ub)
+                    tiny_extra = cat0(tiny_extra, new_tiny_extra)
+                    logging.debug(f'In which {len(new_tiny_lb)} confirmed tiny.')
+
+                wl_lb = cat0(wl_lb, rem_lb)
+                wl_ub = cat0(wl_ub, rem_ub)
+                wl_extra = cat0(wl_extra, rem_extra)
+                wl_safe_dist = cat0(wl_safe_dist, rem_safe_dist)
+                wl_grad = cat0(wl_grad, rem_grad)
+
+            logging.debug(f'After iter {iter}, total #{len(safe_lb)} safe, #{len(wl_lb)} in worklist, ' +
+                          f'total #{len(tiny_lb)} too small and ignored.')
 
             if len(wl_lb) == 0:
                 # nothing to bisect anymore
                 break
 
-            n_curr_abs = len(safe_lb) + len(viol_lb) + len(wl_lb)
+            logging.debug(f'At iter {iter}, worklist safe dist min: {wl_safe_dist.min()}, max: {wl_safe_dist.max()}.')
+
+            n_curr_abs = len(safe_lb) + len(tiny_lb) + len(wl_lb)
             if stop_on_k_all is not None and n_curr_abs >= stop_on_k_all:
                 # has collected enough abstractions
                 break
@@ -350,48 +394,28 @@ class Bisecter(object):
                 # has run enough refinement iterations
                 break
 
-            logging.debug(f'At iter {iter}, Safe dist min: {wl_safe_dist.min()}, max: {wl_safe_dist.max()} ' +
-                          f'Viol dist min: {wl_viol_dist.min()}, max: {wl_viol_dist.max()}.')
+            ''' Pick large loss boxes to bisect first for splitting, so as to generate evenly distributed areas.
+                There is no need to check if entire wl is selected, topk() should do that automatically (I suppose).
+            '''
+            tmp = self._pick_top(batch_size, wl_lb, wl_ub, wl_extra, wl_safe_dist, wl_grad, largest=True)
+            batch_lb, batch_ub, batch_extra, batch_grad = tmp[:4]
+            wl_lb, wl_ub, wl_extra, wl_grad, wl_safe_dist = tmp[4:]
 
-            # Pick large loss boxes to refine, to make overall safety loss smaller and more even
-            picked = self._pick_top(batch_size, wl_lb, wl_ub, wl_extra, wl_safe_dist, wl_viol_dist, wl_grad, largest=True)
-            new_safe_lb, new_viol_lb, batch_lb, wl_lb = picked[0]
-            new_safe_ub, new_viol_ub, batch_ub, wl_ub = picked[1]
-            new_safe_extra, new_viol_extra, batch_extra, wl_extra = picked[2]
-            wl_safe_dist, wl_viol_dist = picked[3], picked[4]
-            batch_grad, wl_grad = picked[5]
-
-            with torch.no_grad():
-                safe_lb = cat0(safe_lb, new_safe_lb)
-                safe_ub = cat0(safe_ub, new_safe_ub)
-                safe_extra = cat0(safe_extra, new_safe_extra)
-                viol_lb = cat0(viol_lb, new_viol_lb)
-                viol_ub = cat0(viol_ub, new_viol_ub)
-                viol_extra = cat0(viol_extra, new_viol_extra)
-
-            logging.debug(f'At iter {iter}, another {len(new_safe_lb) + len(new_viol_lb) + len(batch_lb)} boxes are processed, ' +
-                          f'in which {len(new_safe_lb)} confirmed to safe, {len(new_viol_lb)} confirmed to violate, ' +
-                          f'and total {len(wl_lb) + len(batch_lb)} ready to split.')
-
-            if len(batch_lb) == 0:
-                new_lb, new_ub = empty(), empty()
-                new_extra = None if extra is None else empty().byte()
-            else:
-                refined_outs = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
-                new_lb, new_ub = refined_outs[:2]
-                new_extra = None if batch_extra is None else refined_outs[2]
-            pass
+            refined_outs = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
+            new_lb, new_ub = refined_outs[:2]
+            new_extra = None if batch_extra is None else refined_outs[2]
+            pass  # end of worklist while
 
         logging.debug(f'\nAt the end, split {len(wl_lb)} uncertain (non-zero loss) boxes, ' +
-                      f'{len(safe_lb)} safe boxes and {len(viol_lb)} unsafe boxes.')
+                      f'{len(safe_lb)} safe boxes and {len(tiny_lb)} tiny boxes.')
         if len(wl_lb) > 0:
             logging.debug(f'Non zero loss boxes have safe loss min {wl_safe_dist.min()} ~ max {wl_safe_dist.max()}.')
 
         if collapse_res:
             with torch.no_grad():
-                all_lb = cat0(wl_lb, safe_lb, viol_lb)
-                all_ub = cat0(wl_ub, safe_ub, viol_ub)
-                all_extra = cat0(wl_extra, safe_extra, viol_extra)
+                all_lb = cat0(wl_lb, safe_lb, tiny_lb)
+                all_ub = cat0(wl_ub, safe_ub, tiny_ub)
+                all_extra = cat0(wl_extra, safe_extra, tiny_extra)
 
             if all_extra is None:
                 return all_lb, all_ub
@@ -399,22 +423,26 @@ class Bisecter(object):
                 return all_lb, all_ub, all_extra
         else:
             with torch.no_grad():
-                wl_lb = cat0(wl_lb, viol_lb)
-                wl_ub = cat0(wl_ub, viol_ub)
-                wl_extra = cat0(wl_extra, viol_extra)
+                wl_lb = cat0(wl_lb, tiny_lb)
+                wl_ub = cat0(wl_ub, tiny_ub)
+                wl_extra = cat0(wl_extra, tiny_extra)
             if wl_extra is None:
                 return wl_lb, wl_ub
             else:
                 return wl_lb, wl_ub, wl_extra
 
     def try_certify(self, lb: Tensor, ub: Tensor, extra: Optional[Tensor], forward_fn: nn.Module, batch_size: int,
-              stop_on_k_all: int = None) -> bool:
+              timeout_sec: int) -> bool:
         """
         :return: True if it can successfully certify the property on lb/ub within certain limits
         """
-        wl_lb = self.split(lb, ub, extra, forward_fn, batch_size, stop_on_k_all=stop_on_k_all, collapse_res=False)[0]
-        # empty => all certified
-        return len(wl_lb) == 0
+        try:
+            with timeout(sec=timeout_sec):
+                cex = self.verify(lb, ub, extra, forward_fn, batch_size)
+            return cex is None
+        except TimeoutError:
+            logging.info(f'try_certify() time out before certified or falsified after {timeout_sec} seconds.')
+            return False
     pass
 
 
