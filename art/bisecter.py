@@ -16,7 +16,7 @@ from diffabs.utils import valid_lb_ub
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art.prop import AbsProp
-from art.utils import total_area, pp_time, sample_points
+from art.utils import total_area, pp_time, sample_points, pp_cuda_mem
 
 
 def empty_like(t: Tensor) -> Tensor:
@@ -157,14 +157,6 @@ class Bisecter(object):
             The major difference with split() is that verify() does depth-first-search, checking smaller loss
             abstractions first. Otherwise, the memory consumption of BFS style refinement will explode.
 
-            I experimented "what to pick" and "what to grad" using ACAS property3 to see the explored area after
-            100 iterations. Results show that:
-            *   Pick small violation loss ones is the worst option, perhaps because for most of the time, violation
-                losses are always small.
-            *   Use gradients from violation loss is highest in the rest 2 picking cases. Having safety loss may or may
-                not help. Using safe+viol loss may or may not help. And min(safe, viol) is basically equal to safe loss.
-            So for simplicity, I choose to pick small safe loss boxes and bisect based on gradients from violation loss.
-
             Also, tiny_width is not considered in verify(), it aims to enumerate however small areas, anyway.
 
         :param lb: Batch x ...
@@ -173,13 +165,12 @@ class Bisecter(object):
                       it should satisfy in AndProp; or just None
         :param forward_fn: differentiable forward propagation, not passing in net and call net(input) because different
                            applications may have different net(input, **kwargs)
-        :param ret_on_cex: if True, it will stop searching after finding the first counterexample cube
         :return: (batched) counterexample tensors, if not None
         """
         assert valid_lb_ub(lb, ub)
         assert batch_size > 0
 
-        # track how much have been certified/falsified.
+        # track how much have been certified
         tot_area = total_area(lb, ub)
         assert tot_area > 0
         safes_area = 0.
@@ -205,13 +196,16 @@ class Bisecter(object):
                     reason is that 'factor' can only shrink the space in one direction towards its mid point. This has
                     little to do with actual bisection later on. Grads w.r.t. LB and UB is more directly related.
                 '''
-                ''' 10/21/2020:
-                    Removed viol_dists etc., because viol_dist is worse than sample-to-check. If viol_dist can certify
+                ''' Removed viol_dists etc., because viol_dist is worse than sample-to-check. If viol_dist can certify
                     violation, sampling can absolutely do the same, vice not versa. So there is no need to compute
                     viol_dist anymore. It also shows that using 'safe' is slightly better than 'viol' as source based
                     on first two hard instances in acas-hard.
                 '''
-                new_grad, new_safe_dist = self._grad_dists_of(new_lb, new_ub, new_extra, forward_fn, batch_size)
+                with torch.no_grad():
+                    ''' It's important to have no_grad() here, otherwise the GPU memory will keep growing. With
+                        no_grad(), the GPU memory usage is stable. enable_grad() is called inside for grad computation.
+                    '''
+                    new_grad, new_safe_dist = self._grad_dists_of(new_lb, new_ub, new_extra, forward_fn, batch_size)
 
                 # process safe abstractions here rather than later
                 safe_bits = new_safe_dist <= 0.
@@ -253,6 +247,7 @@ class Bisecter(object):
             wl_area_percent = 100. - safe_area_percent
             logging.debug(f'After iter {iter}, {pp_time(timer() - t0)}, total ({safe_area_percent:.2f}%) safe, ' +
                           f'total #{len(wl_lb)} ({wl_area_percent:.2f}%) in worklist.')
+            # logging.debug(pp_cuda_mem())
 
             if len(wl_lb) == 0:
                 # nothing to bisect anymore

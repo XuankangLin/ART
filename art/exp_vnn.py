@@ -50,7 +50,8 @@ class VerifyArgParser(exp.ExpArgParser):
         self.add_argument('--use_new', action='store_true', default=False,
                           help='use new refinement')
 
-        self.set_defaults(batch_size=4096)  # default batch_size in old verify()
+        # experiment on first two hard tasks show that 8192 is fastest, 4096 and 16384 are slower
+        self.set_defaults(batch_size=8192)
         return
     pass
 

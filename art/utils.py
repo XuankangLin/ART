@@ -3,7 +3,7 @@ from math import floor
 from timeit import default_timer as timer
 
 import torch
-from torch import Tensor
+from torch import Tensor, cuda
 
 from diffabs.utils import valid_lb_ub
 
@@ -71,3 +71,24 @@ def time_since(since, existing=None):
     if existing is not None:
         t += existing
     return pp_time(t)
+
+
+def pp_cuda_mem(stamp: str = '') -> str:
+    def sizeof_fmt(num, suffix='B'):
+        for unit in ['', 'Ki', 'Mi', 'Gi', 'Ti', 'Pi', 'Ei', 'Zi']:
+            if abs(num) < 1024.0:
+                return "%3.1f%s%s" % (num, unit, suffix)
+            num /= 1024.0
+        return "%.1f%s%s" % (num, 'Yi', suffix)
+
+    if not cuda.is_available():
+        return ''
+
+    return '\n'.join([
+        f'----- {stamp} -----',
+        f'Allocated: {sizeof_fmt(cuda.memory_allocated())}',
+        f'Max Allocated: {sizeof_fmt(cuda.max_memory_allocated())}',
+        f'Cached: {sizeof_fmt(cuda.memory_cached())}',
+        f'Max Cached: {sizeof_fmt(cuda.max_memory_cached())}',
+        f'----- End of {stamp} -----'
+    ])
