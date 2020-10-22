@@ -4,6 +4,7 @@ import logging
 import sys
 from pathlib import Path
 from typing import Tuple, Optional, Union
+from timeit import default_timer as timer
 
 import torch
 from torch import Tensor, nn, autograd
@@ -15,7 +16,7 @@ from diffabs.utils import valid_lb_ub
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from art.prop import AbsProp
-from art.utils import total_area
+from art.utils import total_area, pp_time, sample_points
 
 
 def empty_like(t: Tensor) -> Tensor:
@@ -23,8 +24,10 @@ def empty_like(t: Tensor) -> Tensor:
     return torch.tensor([], device=t.device)
 
 
-def cat0(*ts: Tensor) -> Tensor:
+def cat0(*ts: Tensor) -> Optional[Tensor]:
     """ Usage: simplify `torch.cat((ts1, ts2), dim=0)` to `cat0(ts1, ts2)`. """
+    if ts[0] is None:
+        return None
     return torch.cat(ts, dim=0)
 
 
@@ -35,6 +38,10 @@ class Bisecter(object):
         (1) For each input region, it tries to prove either safety or violation by over-approximation.
         (2) If failed, the input region is bisected to a total set of smaller ones, via different heuristics.
         (3) All these input regions are maintained in a work list, algorithm ends when the work list is empty.
+
+        In v1, there was also viol_dists that tries to find a region all certified to violate. This turns out worse
+        than sampling to check violation. Because as long as it can certify to violate, sampling must find a cex,
+        either. After all, if we care about CEX, we need just one of them.
     """
 
     def __init__(self, domain: AbsDom, prop: AbsProp):
@@ -45,126 +52,104 @@ class Bisecter(object):
         self.prop = prop
         return
 
-    def _grad_dists_of_batch(self, new_lb: Tensor, new_ub: Tensor, new_extra: Optional[Tensor], forward_fn: nn.Module,
-                             grad_src: str) -> Tuple[Tensor, Tensor, Tensor]:
-        """ Get the gradient value for each abstraction as heuristic, as long as safe distances and violation distances.
-        :param loss_src: either 'safe' or 'viol' or 'both'
-        """
-        new_lb = new_lb.detach().requires_grad_()
-        new_ub = new_ub.detach().requires_grad_()
-        if new_lb.grad is not None:
-            new_lb.grad.zero_()  # in case any previous grads are unexpectedly accumulated
-        if new_ub.grad is not None:
-            new_ub.grad.zero_()
+    def _grad_dists_of_batch(self, new_lb: Tensor, new_ub: Tensor, new_extra: Optional[Tensor],
+                             forward_fn: nn.Module) -> Tuple[Tensor, Tensor]:
+        """ Get the gradient value for each abstraction as heuristic, as long as safe distances. """
+        with torch.enable_grad():
+            new_lb = new_lb.detach().requires_grad_()
+            new_ub = new_ub.detach().requires_grad_()
+            if new_lb.grad is not None:
+                new_lb.grad.zero_()  # in case any previous grads are unexpectedly accumulated
+            if new_ub.grad is not None:
+                new_ub.grad.zero_()
 
-        ins = self.d.Ele.by_intvl(new_lb, new_ub)
-        outs = forward_fn(ins)
+            ins = self.d.Ele.by_intvl(new_lb, new_ub)
+            outs = forward_fn(ins)
 
-        new_safe_dist = self.prop.safe_dist(outs) if new_extra is None else self.prop.safe_dist(outs, new_extra)
-        new_viol_dist = self.prop.viol_dist(outs) if new_extra is None else self.prop.viol_dist(outs, new_extra)
-        if grad_src == 'safe':
+            new_safe_dist = self.prop.safe_dist(outs) if new_extra is None else self.prop.safe_dist(outs, new_extra)
             grad_dist = new_safe_dist
-        elif grad_src == 'viol':
-            grad_dist = new_viol_dist
-        elif grad_src == 'both':
-            grad_dist = new_safe_dist + new_viol_dist
-        else:
-            raise ValueError(f'Invalid grad_src = {grad_src}.')
 
-        ''' Sum safe/viol_dists to get one single value for backprop. Otherwise it needs to pass in 'grad_outputs'
-            argument for autograd.grad(). e.g., use ones_like(dists).
-            1st order summation will distribute the original output distance to each corresponding input.
-            After all, it only needs to relatively compare input grads.
-        '''
-        assert grad_dist.dim() == 1, 'Do I need to squeeze the losses into <Batch> vector first?'
-        losses = grad_dist.sum()
+            ''' Sum safe/viol_dists to get one single value for backprop. Otherwise it needs to pass in 'grad_outputs'
+                argument for autograd.grad(). e.g., use ones_like(dists).
+                1st order summation will distribute the original output distance to each corresponding input.
+                After all, it only needs to relatively compare input grads.
+            '''
+            assert grad_dist.dim() == 1, 'Do I need to squeeze the losses into <Batch> vector first?'
+            losses = grad_dist.sum()
 
-        # back-propagate safety loss to inputs
-        grads = autograd.grad(losses, [new_lb, new_ub])
-        # Clip grads below. LB should ++. Thus grad for LB should < 0 (LB' = LB - lr * grad). Similar for UB.
-        grads[0].clamp_(max=0.)  # LB
-        grads[1].clamp_(min=0.)  # UB
-        new_grad = sum([g.abs() for g in grads])  # get one value for each abstraction
-        return new_grad, new_safe_dist, new_viol_dist
+            # back-propagate safety loss to inputs
+            grads = autograd.grad(losses, [new_lb, new_ub])
+            # Clip grads below. LB should ++. Thus grad for LB should < 0 (LB' = LB - lr * grad). Similar for UB.
+            grads[0].clamp_(max=0.)  # LB
+            grads[1].clamp_(min=0.)  # UB
+            new_grad = sum([g.abs() for g in grads])  # get one value for each abstraction
+        return new_grad, new_safe_dist
 
     def _grad_dists_of(self, new_lb: Tensor, new_ub: Tensor, new_extra: Optional[Tensor], forward_fn: nn.Module,
-                       grad_src: str, batch_size: int) -> Tuple[Tensor, Tensor, Tensor]:
+                       batch_size: int) -> Tuple[Tensor, Tensor]:
         """ Dispatch the computation to be batch-by-batch.
         :param batch_size: compute the gradients batch-by-batch, so as to avoid huge memory consumption at once.
         """
         absset = AbsData(new_lb, new_ub, new_extra)
         abs_loader = DataLoader(absset, batch_size=batch_size, shuffle=False)
 
-        split_grads, split_safe_dists, split_viol_dists = [], [], []
+        split_grads, split_safe_dists = [], []
         for batch in abs_loader:
             if new_extra is None:
                 batch_lb, batch_ub = batch
                 batch_extra = None
             else:
                 batch_lb, batch_ub, batch_extra = batch
-            new_grad, new_safe_dist, new_viol_dist = self._grad_dists_of_batch(batch_lb, batch_ub, batch_extra,
-                                                                               forward_fn, grad_src)
+            new_grad, new_safe_dist = self._grad_dists_of_batch(batch_lb, batch_ub, batch_extra, forward_fn)
             split_grads.append(new_grad)
             split_safe_dists.append(new_safe_dist)
-            split_viol_dists.append(new_viol_dist)
 
         split_grads = torch.cat(split_grads, dim=0)
         split_safe_dists = torch.cat(split_safe_dists, dim=0)
-        split_viol_dists = torch.cat(split_viol_dists, dim=0)
-        return split_grads, split_safe_dists, split_viol_dists
+        return split_grads, split_safe_dists
 
     def _pick_top(self, top_k: int, wl_lb: Tensor, wl_ub: Tensor, wl_extra: Optional[Tensor], wl_safe_dist: Tensor,
-                  wl_viol_dist: Tensor, wl_grad: Tensor, largest: bool) -> Tuple[Tuple, Tuple, Tuple, Tuple, Tuple, Tuple]:
+                  wl_grad: Tensor, largest: bool) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor,
+                                                           Tensor, Tensor, Optional[Tensor], Tensor, Tensor]:
         """ Use safety loss to pick the abstractions among current work list for bisection.
         :param largest: either pick the largest safety loss or smallest safety loss
-        :return: the separated parts of LB, UB, extra (if any), safe_dist, viol_dist, grad
+        :return: the separated parts of LB, UB, extra (if any), grad, safe_dist
         """
-        # first separate out the known safe/viol ones
-        safe_bits = wl_safe_dist <= 0.
-        viol_bits = wl_viol_dist <= 0.
-        rem_bits = ~ (safe_bits | viol_bits)
+        top_k = min(top_k, len(wl_lb))
 
-        new_safe_lb, new_viol_lb, rem_lb = wl_lb[safe_bits], wl_lb[viol_bits], wl_lb[rem_bits]
-        new_safe_ub, new_viol_ub, rem_ub = wl_ub[safe_bits], wl_ub[viol_bits], wl_ub[rem_bits]
-        new_safe_extra = None if wl_extra is None else wl_extra[safe_bits]
-        new_viol_extra = None if wl_extra is None else wl_extra[viol_bits]
-        rem_extra = None if wl_extra is None else wl_extra[rem_bits]
-        rem_safe_dist = wl_safe_dist[rem_bits]
-        rem_viol_dist = wl_viol_dist[rem_bits]
-        rem_grad = wl_grad[rem_bits]
-
-        if len(rem_lb) == 0:
-            # all are confirmed either safe or violation, nothing to bisect
-            empty_t = empty_like(wl_lb)
-            # new-safe / new-viol / refined / not-refined
-            return (new_safe_lb, new_viol_lb, empty_t, empty_t), \
-                   (new_safe_ub, new_viol_ub, empty_t, empty_t), \
-                   (new_safe_extra, new_viol_extra, rem_extra, rem_extra), \
-                   empty_t, empty_t, (empty_t, empty_t)  # use rem_extra twice, it's fine
-
-        top_k = min(top_k, len(rem_lb))
-
-        # If pytorch has mergesort(), do that, right now it's just simpler (and faster) to use topk().
-        _, topk_idxs = rem_safe_dist.topk(top_k, largest=largest, sorted=False)  # topk_idxs: size <K>
+        ''' If pytorch has mergesort(), do that, right now it's just simpler (and faster) to use topk().
+            I also tried the heapq module, adding each unbatched tensor to heap. However, That is much slower and
+            heappop() raises some weird RuntimeError: Boolean value of Tensor with more than one value is ambiguous..
+        '''
+        _, topk_idxs = wl_safe_dist.topk(top_k, largest=largest, sorted=False)  # topk_idxs: size <K>
         # scatter, topk_idxs are 0, others are 1
-        other_idxs = torch.ones(len(rem_safe_dist), device=rem_safe_dist.device).byte().scatter_(-1, topk_idxs, 0)
+        other_idxs = torch.ones(len(wl_safe_dist), device=wl_safe_dist.device).byte().scatter_(-1, topk_idxs, 0)
         other_idxs = other_idxs.nonzero(as_tuple=True)  # <Batch-K>
 
-        batch_lb, wl_lb = rem_lb[topk_idxs], rem_lb[other_idxs]
-        batch_ub, wl_ub = rem_ub[topk_idxs], rem_ub[other_idxs]
-        batch_extra = None if rem_extra is None else rem_extra[topk_idxs]
-        wl_extra = None if rem_extra is None else rem_extra[other_idxs]
-        wl_safe_dist = rem_safe_dist[other_idxs]  # batch_safe_dist is no longer needed, refinement only needs the grad
-        wl_viol_dist = rem_viol_dist[other_idxs]
-        batch_grad, wl_grad = rem_grad[topk_idxs], rem_grad[other_idxs]
+        batch_lb, rem_lb = wl_lb[topk_idxs], wl_lb[other_idxs]
+        batch_ub, rem_ub = wl_ub[topk_idxs], wl_ub[other_idxs]
+        batch_extra = None if wl_extra is None else wl_extra[topk_idxs]
+        rem_extra = None if wl_extra is None else wl_extra[other_idxs]
+        rem_safe_dist = wl_safe_dist[other_idxs]  # batch_safe_dist is no longer needed, refinement only needs the grad
+        batch_grad, rem_grad = wl_grad[topk_idxs], wl_grad[other_idxs]
 
-        return (new_safe_lb, new_viol_lb, batch_lb, wl_lb),\
-               (new_safe_ub, new_viol_ub, batch_ub, wl_ub),\
-               (new_safe_extra, new_viol_extra, batch_extra, wl_extra),\
-               wl_safe_dist, wl_viol_dist, (batch_grad, wl_grad)
+        return batch_lb, batch_ub, batch_extra, batch_grad,\
+               rem_lb, rem_ub, rem_extra, rem_grad, rem_safe_dist
+
+    def _sample_check(self, lb: Tensor, ub: Tensor, extra: Optional[Tensor], forward_fn: nn.Module) -> Optional[Tensor]:
+        """ Sample points from given input abstractions and check their safety. If found cex, return it/them. """
+        # just sample 1 point per abstraction for now, can have K>1 if extra is also duplicated
+        pts = sample_points(lb, ub, K=1)
+        outs = forward_fn(pts)
+        viol_dist = self.prop.viol_dist_conc(outs, extra)
+        viol_bits = viol_dist <= 0.
+        if viol_bits.any():
+            cex = pts[viol_bits]
+            return cex
+        return None
 
     def verify(self, lb: Tensor, ub: Tensor, extra: Optional[Tensor], forward_fn: nn.Module,
-               ret_on_cex: bool = True, batch_size: int = 4096) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]:
+               batch_size: int = 4096) -> Optional[Tensor]:
         """ Considers both safety loss and violation loss to certify or falsify the given property up to some limit.
             If counterexamples are found, return the LB/UB bounds of the cex cube -- all points within are cexs.
             Otherwise, return emtpy tensors.
@@ -180,6 +165,8 @@ class Bisecter(object):
                 not help. Using safe+viol loss may or may not help. And min(safe, viol) is basically equal to safe loss.
             So for simplicity, I choose to pick small safe loss boxes and bisect based on gradients from violation loss.
 
+            Also, tiny_width is not considered in verify(), it aims to enumerate however small areas, anyway.
+
         :param lb: Batch x ...
         :param ub: Batch x ...
         :param extra: could contain extra info such as the bit vectors for each LB/UB cube showing which safety property
@@ -187,7 +174,7 @@ class Bisecter(object):
         :param forward_fn: differentiable forward propagation, not passing in net and call net(input) because different
                            applications may have different net(input, **kwargs)
         :param ret_on_cex: if True, it will stop searching after finding the first counterexample cube
-        :return: <LB, UB> tensors with size <Batch x ...> containing counterexample boxes' bounds, if any
+        :return: (batched) counterexample tensors, if not None
         """
         assert valid_lb_ub(lb, ub)
         assert batch_size > 0
@@ -196,18 +183,15 @@ class Bisecter(object):
         tot_area = total_area(lb, ub)
         assert tot_area > 0
         safes_area = 0.
-        viols_area = 0.
+        t0 = timer()
 
         def empty() -> Tensor:
             return empty_like(lb)
 
+        # no need to save safe_lb/safe_ub
         wl_lb, wl_ub = empty(), empty()
-        safe_lb, safe_ub = empty(), empty()
-        viol_lb, viol_ub = empty(), empty()
         wl_extra = None if extra is None else empty().byte()
-        safe_extra = None if extra is None else empty().byte()
-        viol_extra = None if extra is None else empty().byte()
-        wl_safe_dist, wl_viol_dist, wl_grad = empty(), empty(), empty()
+        wl_safe_dist, wl_grad = empty(), empty()
 
         new_lb, new_ub, new_extra = lb, ub, extra
         iter = 0
@@ -221,62 +205,78 @@ class Bisecter(object):
                     reason is that 'factor' can only shrink the space in one direction towards its mid point. This has
                     little to do with actual bisection later on. Grads w.r.t. LB and UB is more directly related.
                 '''
-                # experiment on prop2 says this is better than safe, safe+viol, min(safe, viol)
-                new_grad, new_safe_dist, new_viol_dist = self._grad_dists_of(new_lb, new_ub, new_extra, forward_fn,
-                                                                             'viol', batch_size)
-                wl_lb = cat0(wl_lb, new_lb)
-                wl_ub = cat0(wl_ub, new_ub)
-                wl_extra = None if wl_extra is None else cat0(wl_extra, new_extra)
-                wl_safe_dist = cat0(wl_safe_dist, new_safe_dist)
-                wl_viol_dist = cat0(wl_viol_dist, new_viol_dist)
-                wl_grad = cat0(wl_grad, new_grad)
+                ''' 10/21/2020:
+                    Removed viol_dists etc., because viol_dist is worse than sample-to-check. If viol_dist can certify
+                    violation, sampling can absolutely do the same, vice not versa. So there is no need to compute
+                    viol_dist anymore. It also shows that using 'safe' is slightly better than 'viol' as source based
+                    on first two hard instances in acas-hard.
+                '''
+                new_grad, new_safe_dist = self._grad_dists_of(new_lb, new_ub, new_extra, forward_fn, batch_size)
+
+                # process safe abstractions here rather than later
+                safe_bits = new_safe_dist <= 0.
+                rem_bits = ~ safe_bits
+
+                logging.debug(f'At iter {iter}, another {len(new_lb)} boxes are processed.')
+                if safe_bits.any():
+                    # transfer certified safe ones
+                    new_safe_lb, rem_lb = new_lb[safe_bits], new_lb[rem_bits]  # for calculating area only
+                    new_safe_ub, rem_ub = new_ub[safe_bits], new_ub[rem_bits]
+                    rem_extra = None if new_extra is None else new_extra[rem_bits]  # new_safe_extra not needed for area
+                    rem_safe_dist = new_safe_dist[rem_bits]
+                    rem_grad = new_grad[rem_bits]
+
+                    new_safes_area = total_area(new_safe_lb, new_safe_ub)
+                    safes_area += new_safes_area
+                    logging.debug(f'In which {len(new_safe_lb)} confirmed safe.')
+                else:
+                    # nothing to split, inherit everything
+                    rem_lb, rem_ub, rem_extra = new_lb, new_ub, new_extra
+                    rem_safe_dist, rem_grad = new_safe_dist, new_grad
+                    logging.debug(f'In which no new abstractions confirmed safe.')
+
+                if len(rem_lb) > 0:
+                    # sample check the rest and add to worklist
+                    cex = self._sample_check(rem_lb, rem_ub, rem_extra, forward_fn)
+                    if cex is not None:
+                        # found cex!
+                        logging.debug(f'CEX found by sampling: {cex}')
+                        return cex
+
+                wl_lb = cat0(wl_lb, rem_lb)
+                wl_ub = cat0(wl_ub, rem_ub)
+                wl_extra = cat0(wl_extra, rem_extra)
+                wl_safe_dist = cat0(wl_safe_dist, rem_safe_dist)
+                wl_grad = cat0(wl_grad, rem_grad)
+
+            safe_area_percent = safes_area / tot_area * 100
+            wl_area_percent = 100. - safe_area_percent
+            logging.debug(f'After iter {iter}, {pp_time(timer() - t0)}, total ({safe_area_percent:.2f}%) safe, ' +
+                          f'total #{len(wl_lb)} ({wl_area_percent:.2f}%) in worklist.')
 
             if len(wl_lb) == 0:
                 # nothing to bisect anymore
                 break
 
-            logging.debug(f'At iter {iter}, Safe dist min: {wl_safe_dist.min()}, max: {wl_safe_dist.max()} ' +
-                          f'Viol dist min: {wl_viol_dist.min()}, max: {wl_viol_dist.max()}.')
+            logging.debug(f'In worklist, safe dist min: {wl_safe_dist.min()}, max: {wl_safe_dist.max()}.')
 
-            # Pick small loss boxes to bisect first for verification, otherwise BFS style consumes huge memory
-            picked = self._pick_top(batch_size, wl_lb, wl_ub, wl_extra, wl_safe_dist, wl_viol_dist, wl_grad, largest=False)
-            new_safe_lb, new_viol_lb, batch_lb, wl_lb = picked[0]
-            new_safe_ub, new_viol_ub, batch_ub, wl_ub = picked[1]
-            new_safe_extra, new_viol_extra, batch_extra, wl_extra = picked[2]
-            wl_safe_dist, wl_viol_dist = picked[3], picked[4]
-            batch_grad, wl_grad = picked[5]
-
-            with torch.no_grad():
-                safe_lb = cat0(safe_lb, new_safe_lb)
-                safe_ub = cat0(safe_ub, new_safe_ub)
-                safe_extra = None if safe_extra is None else cat0(safe_extra, new_safe_extra)
-                viol_lb = cat0(viol_lb, new_viol_lb)
-                viol_ub = cat0(viol_ub, new_viol_ub)
-                viol_extra = None if viol_extra is None else cat0(viol_extra, new_viol_extra)
-
-            new_safes_area = total_area(new_safe_lb, new_safe_ub)
-            new_viols_area = total_area(new_viol_lb, new_viol_ub)
-            safes_area += new_safes_area
-            viols_area += new_viols_area
-
-            logging.debug(f'At iter {iter}, another {len(new_safe_lb) + len(new_viol_lb) + len(batch_lb)} boxes are processed, ' +
-                          f'in which {len(new_safe_lb)} confirmed to safe, {len(new_viol_lb)} confirmed to violate, ' +
-                          f'and total {len(wl_lb) + len(batch_lb)} ready to split.')
-            logging.debug(f'+ new safes area {new_safes_area / tot_area * 100 :.2f}%, ' +
-                          f'+ new viols area {new_viols_area / tot_area * 100 :.2f}%, ' +
-                          f'total processed area {(safes_area + viols_area) / tot_area * 100 :.2f}%.\n')
-
-            if ret_on_cex and len(new_viol_lb) > 0:  # find one cex, stop
-                break
-
-            if len(batch_lb) == 0:
-                new_lb, new_ub = empty(), empty()
-                new_extra = None if extra is None else empty().byte()
+            if batch_size >= len(wl_lb):
+                # entire wl is to be picked
+                batch_lb, batch_ub, batch_extra, batch_grad = wl_lb, wl_ub, wl_extra, wl_grad
+                wl_lb, wl_ub = empty(), empty()
+                wl_extra = None if wl_extra is None else empty().byte()
+                wl_grad = empty()
+                wl_safe_dist = empty()
             else:
-                refined_outs = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
-                new_lb, new_ub = refined_outs[:2]
-                new_extra = None if batch_extra is None else refined_outs[2]
-        return viol_lb, viol_ub
+                # pick small loss boxes to bisect first for verification, otherwise BFS style consumes huge memory
+                tmp = self._pick_top(batch_size, wl_lb, wl_ub, wl_extra, wl_safe_dist, wl_grad, largest=False)
+                batch_lb, batch_ub, batch_extra, batch_grad = tmp[:4]
+                wl_lb, wl_ub, wl_extra, wl_grad, wl_safe_dist = tmp[4:]
+
+            refined_outs = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
+            new_lb, new_ub = refined_outs[:2]
+            new_extra = None if batch_extra is None else refined_outs[2]
+        return None
 
     def split(self, lb: Tensor, ub: Tensor, extra: Optional[Tensor], forward_fn: nn.Module, batch_size: int,
               stop_on_k_all: int = None,
@@ -335,7 +335,7 @@ class Bisecter(object):
                                                                              'safe', batch_size)
                 wl_lb = cat0(wl_lb, new_lb)
                 wl_ub = cat0(wl_ub, new_ub)
-                wl_extra = None if wl_extra is None else cat0(wl_extra, new_extra)
+                wl_extra = cat0(wl_extra, new_extra)
                 wl_safe_dist = cat0(wl_safe_dist, new_safe_dist)
                 wl_viol_dist = cat0(wl_viol_dist, new_viol_dist)
                 wl_grad = cat0(wl_grad, new_grad)
@@ -369,10 +369,10 @@ class Bisecter(object):
             with torch.no_grad():
                 safe_lb = cat0(safe_lb, new_safe_lb)
                 safe_ub = cat0(safe_ub, new_safe_ub)
-                safe_extra = None if safe_extra is None else cat0(safe_extra, new_safe_extra)
+                safe_extra = cat0(safe_extra, new_safe_extra)
                 viol_lb = cat0(viol_lb, new_viol_lb)
                 viol_ub = cat0(viol_ub, new_viol_ub)
-                viol_extra = None if viol_extra is None else cat0(viol_extra, new_viol_extra)
+                viol_extra = cat0(viol_extra, new_viol_extra)
 
             logging.debug(f'At iter {iter}, another {len(new_safe_lb) + len(new_viol_lb) + len(batch_lb)} boxes are processed, ' +
                           f'in which {len(new_safe_lb)} confirmed to safe, {len(new_viol_lb)} confirmed to violate, ' +
@@ -396,7 +396,7 @@ class Bisecter(object):
             with torch.no_grad():
                 all_lb = cat0(wl_lb, safe_lb, viol_lb)
                 all_ub = cat0(wl_ub, safe_ub, viol_ub)
-                all_extra = None if safe_extra is None else cat0(wl_extra, safe_extra, viol_extra)
+                all_extra = cat0(wl_extra, safe_extra, viol_extra)
 
             if all_extra is None:
                 return all_lb, all_ub
@@ -406,7 +406,7 @@ class Bisecter(object):
             with torch.no_grad():
                 wl_lb = cat0(wl_lb, viol_lb)
                 wl_ub = cat0(wl_ub, viol_ub)
-                wl_extra = None if wl_extra is None else cat0(wl_extra, viol_extra)
+                wl_extra = cat0(wl_extra, viol_extra)
             if wl_extra is None:
                 return wl_lb, wl_ub
             else:

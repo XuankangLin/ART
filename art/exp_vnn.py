@@ -22,6 +22,7 @@ from art.refine import Bisecter as NewBisecter
 from art.vnn import VNN20Info
 from art.utils import pp_time, fmt_args
 
+
 RES_DIR = Path(__file__).resolve().parent.parent / 'results' / 'vnn'
 RES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -91,8 +92,7 @@ def verify_net_prop(parser: VerifyArgParser):
     logging.info(f'===== Processing {nid}, verifying one property {all_props.name} =====')
     res = _verify(nid, all_props, args)
     t0 = timer()
-    res = res[:2]
-    logging.info(f'After {pp_time(timer() - t0)}, verify result -- Viol LB/UB: {res}\n\n')
+    logging.info(f'After {pp_time(timer() - t0)}, verify result -- CEX: {res}\n\n')
     return res
 
 
@@ -125,8 +125,7 @@ def verify_tasks(parser: VerifyArgParser):
         logging.info(f'===== Processing {nid}, verifying one property {all_props.name} =====')
         t0 = timer()
         res = _verify(nid, all_props, args)
-        res = res[:2]
-        logging.info(f'After {pp_time(timer() - t0)}, verify result -- Viol LB/UB: {res}\n\n')
+        logging.info(f'After {pp_time(timer() - t0)}, verify result -- CEX: {res}\n\n')
     return
 
 
@@ -145,8 +144,7 @@ def verify_net(parser: VerifyArgParser):
     logging.info(f'===== Processing {nid}, verifying all its props {all_props.name} =====')
     t0 = timer()
     res = _verify(nid, all_props, args)
-    res = res[:2]
-    logging.info(f'After {pp_time(timer() - t0)}, verify result: {res}\n\n')
+    logging.info(f'After {pp_time(timer() - t0)}, verify result -- CEX: {res}\n\n')
     return res
 
 
@@ -160,7 +158,7 @@ if __name__ == '__main__':
         'exp_fn': 'verify_tasks',
 
         'task_i': 0,
-        'task_j': 5,  # [0, 5) tasks
+        'task_j': 2,  # [0, 5) tasks
         'series': 'hard',
     }
     parser = VerifyArgParser(RES_DIR, description='NN Verification Experiment')

@@ -304,6 +304,32 @@ class AndProp(AbsProp):
         res = torch.stack(res, dim=-1)  # Batch x nprops
         mins, _ = torch.min(res, dim=-1)
         return mins
+
+    def viol_dist_conc(self, outs: Tensor, bitmap: Tensor, *args, **kwargs):
+        """ min(every prop's viol_dists)
+        :param bitmap: the bit-vectors corresponding to outputs, showing what rules they should obey
+        """
+        res = []
+        for i, prop in enumerate(self.props):
+            bits = bitmap[..., i]
+            if not bits.any():
+                # no one here needs to obey this property
+                continue
+
+            ''' The default nonzero(as_tuple=True) returns a tuple, make scatter_() unhappy.
+                Here we just extract the real data from it to make it the same as old nonzero().squeeze(dim=-1).
+            '''
+            bits = bits.nonzero(as_tuple=True)[0]
+            assert bits.dim() == 1
+            piece_outs = outs[bits]
+            piece_dists = prop.viol_dist_conc(piece_outs, *args, **kwargs)
+            full_dists = torch.full((len(bitmap), *piece_dists.size()[1:]), float('inf'), device=piece_dists.device)
+            full_dists.scatter_(0, bits, piece_dists)
+            res.append(full_dists)
+
+        res = torch.stack(res, dim=-1)  # Batch x nprops
+        mins, _ = torch.min(res, dim=-1)
+        return mins
     pass
 
 
