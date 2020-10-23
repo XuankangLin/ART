@@ -125,7 +125,8 @@ class Bisecter(object):
         return (new_safe_lb, new_safe_ub, new_safe_extra),\
                (rem_lb, rem_ub, rem_extra, rem_safe_dist, rem_grad)
 
-    def _pick_top(self, top_k: int, wl_lb: Tensor, wl_ub: Tensor, wl_extra: Optional[Tensor], wl_safe_dist: Tensor,
+    @staticmethod
+    def _pick_top(top_k: int, wl_lb: Tensor, wl_ub: Tensor, wl_extra: Optional[Tensor], wl_safe_dist: Tensor,
                   wl_grad: Tensor, largest: bool) -> Tuple[Tensor, Tensor, Optional[Tensor], Tensor,
                                                            Tensor, Tensor, Optional[Tensor], Tensor, Tensor]:
         """ Use safety loss to pick the abstractions among current work list for bisection.
@@ -167,9 +168,7 @@ class Bisecter(object):
 
     def verify(self, lb: Tensor, ub: Tensor, extra: Optional[Tensor], forward_fn: nn.Module,
                batch_size: int = 4096) -> Optional[Tensor]:
-        """ Considers both safety loss and violation loss to certify or falsify the given property up to some limit.
-            If counterexamples are found, return the LB/UB bounds of the cex cube -- all points within are cexs.
-            Otherwise, return emtpy tensors.
+        """ Verify the safety property or return some found counterexamples.
 
             The major difference with split() is that verify() does depth-first-search, checking smaller loss
             abstractions first. Otherwise, the memory consumption of BFS style refinement will explode.
@@ -182,6 +181,7 @@ class Bisecter(object):
                       it should satisfy in AndProp; or just None
         :param forward_fn: differentiable forward propagation, not passing in net and call net(input) because different
                            applications may have different net(input, **kwargs)
+        :param batch_size: how many to bisect once at one time
         :return: (batched) counterexample tensors, if not None
         """
         assert valid_lb_ub(lb, ub)
