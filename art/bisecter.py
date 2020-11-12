@@ -265,9 +265,7 @@ class Bisecter(object):
             batch_lb, batch_ub, batch_extra, batch_grad = tmp[:4]
             wl_lb, wl_ub, wl_extra, wl_grad, wl_safe_dist = tmp[4:]
 
-            refined_outs = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
-            new_lb, new_ub = refined_outs[:2]
-            new_extra = None if batch_extra is None else refined_outs[2]
+            new_lb, new_ub, new_extra = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
         return None
 
     @staticmethod
@@ -401,9 +399,7 @@ class Bisecter(object):
             batch_lb, batch_ub, batch_extra, batch_grad = tmp[:4]
             wl_lb, wl_ub, wl_extra, wl_grad, wl_safe_dist = tmp[4:]
 
-            refined_outs = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
-            new_lb, new_ub = refined_outs[:2]
-            new_extra = None if batch_extra is None else refined_outs[2]
+            new_lb, new_ub, new_extra = by_smear(batch_lb, batch_ub, batch_extra, batch_grad)
             pass  # end of worklist while
 
         logging.debug(f'\nAt the end, split {len(wl_lb)} uncertain (non-zero loss) boxes, ' +
@@ -447,11 +443,10 @@ class Bisecter(object):
 
 
 def bisect_by(lb: Tensor, ub: Tensor, idxs: Tensor,
-              extra: Tensor = None) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]:
+              extra: Tensor = None) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """ Bisect specific columns.
     :param idxs: <Batch>, as the indices from torch.max()
     :param extra: if not None, it contains the bit vector for each LB/UB piece showing which prop they should obey
-    :return: <New LB, New UB> if extra is None, otherwise <New LB, New UB, New Extra>
     """
     # scatter_() to convert indices into one-hot encoding
     split_idxs = idxs.unsqueeze(dim=-1)  # Batch x 1
@@ -466,24 +461,21 @@ def bisect_by(lb: Tensor, ub: Tensor, idxs: Tensor,
 
     newlb = cat0(lefts_lb, rights_lb)
     newub = cat0(lefts_ub, rights_ub)
-    if extra is None:
-        return newlb, newub
-
     newextra = cat0(extra, extra)
     return newlb, newub, newextra
 
 
 def by_smear(new_rem_lb: Tensor, new_rem_ub: Tensor, new_rem_extra: Optional[Tensor], new_rem_grad: Tensor,
-             tiny_width: float = None) -> Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor]]:
-    """
-    Experiment shows that smear = grad * dim_width as in ReluVal is the best heuristic tried so far. It's better
-    than either one alone, and better than other indirect loss e.g., introduced over-approximated area.
-    :return: if new_rem_extra is None, return <refined LB, UB> without extra, otherwise return with extra
+             tiny_width: float = None) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """ Experiment shows that smear = grad * dim_width as in ReluVal is the best heuristic tried so far. It's better
+        than either one alone, and better than other indirect loss e.g., introduced over-approximated area. Also tried
+        K-smear-followed-by-1-width, or grad-then-width, both become worse. Moreover, normalization on grad/width also
+        makes it worse.
     """
     with torch.no_grad():
         width = new_rem_ub - new_rem_lb
         assert new_rem_lb.dim() == 2, 'Otherwise, I need to reduce the >2 dims to compute dim width?'
-        smears = new_rem_grad * width / 2
+        smears = new_rem_grad * width  # tried normalization, didn't do any better..
 
         if tiny_width is not None:
             # consider only those dimensions that are not tiny
@@ -492,3 +484,11 @@ def by_smear(new_rem_lb: Tensor, new_rem_ub: Tensor, new_rem_extra: Optional[Ten
 
         _, split_idxs = smears.max(dim=-1)
         return bisect_by(new_rem_lb, new_rem_ub, split_idxs, new_rem_extra)
+
+
+def by_width(new_rem_lb: Tensor, new_rem_ub: Tensor, new_rem_extra: Optional[Tensor], new_rem_grad: Tensor,
+             tiny_width: float = None) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    width = new_rem_ub - new_rem_lb
+    assert new_rem_lb.dim() == 2, 'Otherwise, I need to reduce the >2 dims to compute dim width?'
+    split_idxs = width.argmax(dim=-1)
+    return bisect_by(new_rem_lb, new_rem_ub, split_idxs, new_rem_extra)
