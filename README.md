@@ -1,6 +1,7 @@
 # ART
 
-The code for paper "ART: Abstraction Refinement-Guided Training for Provably Correct Neural Networks" appearing in FMCAD'20.
+The code for paper "ART: Abstraction Refinement-Guided Training for Provably
+Correct Neural Networks" appearing in FMCAD'20. See tag `fmcad20`.
 
 
 ## Installation
@@ -17,6 +18,15 @@ To replay the evaluation, run individual script from `scripts/` by
 bash scripts/...
 ```
 The corresponding logs have been saved in `results/xxx/...` directory.
+
+Alternatively, one can directly run via Docker at
+[xuankanglin/art](https://hub.docker.com/r/xuankanglin/art). To run jupyter
+notebook in Docker, use customizable commands like
+```
+docker run -p 8888:8888 --rm --gpus=all xuankanglin/art jupyter notebook --allow-root --ip 0.0.0.0 --no-browser --port 8888
+```
+then visit through `localhost:8888` in browser, assuming `nvidia-docker2` is
+installed to enable GPU.
 
 
 ## License
